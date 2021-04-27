@@ -22,6 +22,8 @@ lazy_static! {
     static ref TRACES: Mutex<HashMap<i32, Trace>> = Mutex::new(HashMap::new());
 }
 
+// this is taken from nix rust bindings: https://github.com/nix-rust/nix
+// all credits goes to them. license: MIT
 //noinspection RsBorrowChecker
 unsafe fn from_libc_sockaddr(addr: *const sockaddr) -> Option<SockAddr> {
     if addr.is_null() {

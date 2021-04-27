@@ -1,39 +1,23 @@
 extern crate libc;
-
 #[macro_use]
 extern crate redhook;
 
-#[macro_use]
-extern crate lazy_static;
+use std::ptr;
+use std::time::{Duration, SystemTime};
 
-use libc::{size_t, ssize_t, c_int, c_char, socklen_t, sockaddr};
-use std::{ptr};
-use std::collections::HashMap;
-use std::sync::Mutex;
-use nix::sys::socket::{AddressFamily, VsockAddr, SockAddr, LinkAddr, NetlinkAddr, InetAddr};
-use rustracing_jaeger::{Tracer};
-use rustracing::sampler::AllSampler;
-use crossbeam_channel::{Sender, Receiver};
-use rustracing_jaeger::span::{SpanSender, FinishedSpan, SpanContextState, Span};
-use rustracing::span::{SpanReceiver};
+use libc::{c_char, c_int, size_t, sockaddr, socklen_t, ssize_t};
+use nix::sys::socket::{AddressFamily, InetAddr, LinkAddr, NetlinkAddr, SockAddr, VsockAddr};
+use rustracing::tag::Tag;
 use rustracing_jaeger::reporter::JaegerCompactReporter;
-use std::time::{SystemTime, Duration};
-use std::net::{SocketAddrV4, Ipv4Addr, SocketAddr, IpAddr};
-use std::thread::sleep;
 
+use crate::singleton::{tracer, traces};
+
+mod singleton;
 
 struct Trace {
-    dst_addr: String,
+    dst_addr: Box<String>,
     req: Option<String>,
     res: Option<String>,
-}
-
-lazy_static! {
-    static ref TRACES: Mutex<HashMap<i32, Trace>> = Mutex::new(HashMap::new());
-}
-
-lazy_static! {
-    static ref TRACER: (Tracer, SpanReceiver<SpanContextState>) = Tracer::new(AllSampler);
 }
 
 // this is taken from nix rust bindings: https://github.com/nix-rust/nix
@@ -93,9 +77,29 @@ fn vec_i8_into_u8(v: Vec<i8>) -> Vec<u8> {
     unsafe { Vec::from_raw_parts(p as *mut u8, len, cap) }
 }
 
+fn process_request(sockfd: c_int, payload: String) {
+    let t = traces();
+    let mut t = t.inner.lock().unwrap();
+    if let Some(t) = t.get_mut(&sockfd) {
+        let mut req_headers = [httparse::EMPTY_HEADER; 16];
+        let mut req = httparse::Request::new(&mut req_headers);
+        req.parse(payload.as_bytes()).unwrap();
+
+        let tr = tracer();
+        let tr = tr.inner.lock().unwrap();
+        tr.0.span(format!("{} {}", req.method.unwrap(), req.path.unwrap()))
+            .tag(Tag::new("to", format!("{}", t.dst_addr)))
+            .start_time(SystemTime::now())
+            .start();
+
+        t.req = Some(payload);
+    }
+}
+
 fn process_response(sockfd: c_int, payload: String) {
     {
-        let mut t = TRACES.lock().unwrap();
+        let t = traces();
+        let mut t = t.inner.lock().unwrap();
         if let Some(t) = t.get_mut(&sockfd) {
             t.res = Some(payload);
             if t.req.is_some() {
@@ -110,43 +114,26 @@ fn process_response(sockfd: c_int, payload: String) {
                 let mut res = httparse::Response::new(&mut res_headers);
                 res.parse(res_str.as_bytes()).unwrap();
 
-                let span = TRACER.1.recv_timeout(Duration::from_secs(1)).unwrap();
-
-                println!("{:?}", span);
+                let tr = tracer();
+                let span = tr.inner.lock().unwrap().1.recv_timeout(Duration::from_secs(1)).unwrap();
 
                 let reporter = JaegerCompactReporter::new("sample_service").unwrap();
                 reporter.report(&[span]).unwrap();
             }
         }
     }
-    TRACES.lock().unwrap().remove(&sockfd);
-}
-
-fn process_request(sockfd: c_int, payload: String) {
-    {
-        let mut t = TRACES.lock().unwrap();
-        if let Some(t) = t.get_mut(&sockfd) {
-            let mut req_headers = [httparse::EMPTY_HEADER; 16];
-            let mut req = httparse::Request::new(&mut req_headers);
-            req.parse(payload.as_bytes()).unwrap();
-
-            let _span = TRACER.0.span(format!("{} {}", req.method.unwrap(), req.path.unwrap()))
-                .start_time(SystemTime::now())
-                .start();
-            t.req = Some(payload);
-        }
-    }
+    traces().inner.lock().unwrap().remove(&sockfd);
 }
 
 fn add_trace(sockfd: c_int, addr_in: Option<SockAddr>) {
     if let Some(addr_in) = addr_in {
         let trace = Trace {
-            dst_addr: addr_in.to_str(),
+            dst_addr: Box::new(addr_in.to_str()),
             req: None,
             res: None,
         };
-        if !TRACES.lock().unwrap().contains_key(&sockfd) {
-            TRACES.lock().unwrap().insert(sockfd, trace);
+        if !traces().inner.lock().unwrap().contains_key(&sockfd) {
+            traces().inner.lock().unwrap().insert(sockfd, trace);
         }
     }
 }

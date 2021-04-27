@@ -11,6 +11,16 @@ use std::{ptr};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use nix::sys::socket::{AddressFamily, VsockAddr, SockAddr, LinkAddr, NetlinkAddr, InetAddr};
+use rustracing_jaeger::{Tracer};
+use rustracing::sampler::AllSampler;
+use crossbeam_channel::{Sender, Receiver};
+use rustracing_jaeger::span::{SpanSender, FinishedSpan, SpanContextState, Span};
+use rustracing::span::{SpanReceiver};
+use rustracing_jaeger::reporter::JaegerCompactReporter;
+use std::time::{SystemTime, Duration};
+use std::net::{SocketAddrV4, Ipv4Addr, SocketAddr, IpAddr};
+use std::thread::sleep;
+
 
 struct Trace {
     dst_addr: String,
@@ -20,6 +30,10 @@ struct Trace {
 
 lazy_static! {
     static ref TRACES: Mutex<HashMap<i32, Trace>> = Mutex::new(HashMap::new());
+}
+
+lazy_static! {
+    static ref TRACER: (Tracer, SpanReceiver<SpanContextState>) = Tracer::new(AllSampler);
 }
 
 // this is taken from nix rust bindings: https://github.com/nix-rust/nix
@@ -96,7 +110,12 @@ fn process_response(sockfd: c_int, payload: String) {
                 let mut res = httparse::Response::new(&mut res_headers);
                 res.parse(res_str.as_bytes()).unwrap();
 
-                println!("addr: {} -> {} {} status: {}", t.dst_addr, req.method.unwrap(), req.path.unwrap(), res.code.unwrap());
+                let span = TRACER.1.recv_timeout(Duration::from_secs(1)).unwrap();
+
+                println!("{:?}", span);
+
+                let reporter = JaegerCompactReporter::new("sample_service").unwrap();
+                reporter.report(&[span]).unwrap();
             }
         }
     }
@@ -107,6 +126,13 @@ fn process_request(sockfd: c_int, payload: String) {
     {
         let mut t = TRACES.lock().unwrap();
         if let Some(t) = t.get_mut(&sockfd) {
+            let mut req_headers = [httparse::EMPTY_HEADER; 16];
+            let mut req = httparse::Request::new(&mut req_headers);
+            req.parse(payload.as_bytes()).unwrap();
+
+            let _span = TRACER.0.span(format!("{} {}", req.method.unwrap(), req.path.unwrap()))
+                .start_time(SystemTime::now())
+                .start();
             t.req = Some(payload);
         }
     }
@@ -117,7 +143,7 @@ fn add_trace(sockfd: c_int, addr_in: Option<SockAddr>) {
         let trace = Trace {
             dst_addr: addr_in.to_str(),
             req: None,
-            res: None
+            res: None,
         };
         if !TRACES.lock().unwrap().contains_key(&sockfd) {
             TRACES.lock().unwrap().insert(sockfd, trace);

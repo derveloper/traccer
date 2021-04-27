@@ -13,6 +13,9 @@ rayon = "1.5"
 lazy_static = "1.4.0"
 nix = "0.20.0"
 httparse = "1.4.0"
+rustracing_jaeger = "0.6.1"
+rustracing = "0.5.0"
+crossbeam-channel = "0.5"
 
 [lib]
 name = "mylib"

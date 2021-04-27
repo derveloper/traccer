@@ -4,7 +4,7 @@ hook into processes via `LD_PRELOAD` to trace (http) request and send traces to 
 
 ## WARNING: highly experimental!
 
-This library is for educational purposes, do not use it for production!
+This library is for educational purposes, it doesn't do what it pretend to, it evenually will do it, do not use it for production!
 
 ## Usage
 

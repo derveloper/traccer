@@ -11,5 +11,5 @@ This library is for educational purposes, it doesn't do what it pretend to, it e
 you can use traccer via `LD_PRELOAD`:
 
 ```shell
-cargo build && LD_PRELOAD=target/debug/libmylib.so curl google.de
+cargo build && LD_PRELOAD=target/debug/libtraccer.so curl google.de
 ```

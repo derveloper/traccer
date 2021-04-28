@@ -3,7 +3,7 @@ extern crate libc;
 extern crate redhook;
 
 use std::ptr;
-use std::time::{Duration, SystemTime};
+use std::time::{SystemTime};
 
 use libc::{c_char, c_int, size_t, sockaddr, socklen_t, ssize_t};
 use nix::sys::socket::{AddressFamily, InetAddr, LinkAddr, NetlinkAddr, SockAddr, VsockAddr};
@@ -11,13 +11,15 @@ use rustracing::tag::Tag;
 use rustracing_jaeger::reporter::JaegerCompactReporter;
 
 use crate::singleton::{tracer, traces};
+use rustracing_jaeger::span::SpanContext;
+use std::collections::HashMap;
 
 mod singleton;
 
 struct Trace {
     dst_addr: Box<String>,
-    req: Option<String>,
-    res: Option<String>,
+    req_headers: Option<String>,
+    req_body: Option<String>,
 }
 
 // this is taken from nix rust bindings: https://github.com/nix-rust/nix
@@ -81,18 +83,24 @@ fn process_request(sockfd: c_int, payload: String) {
     let t = traces();
     let mut t = t.inner.lock().unwrap();
     if let Some(t) = t.get_mut(&sockfd) {
+        println!("PROCESS REQ");
         let mut req_headers = [httparse::EMPTY_HEADER; 16];
         let mut req = httparse::Request::new(&mut req_headers);
-        req.parse(payload.as_bytes()).unwrap();
+        let body_start = req.parse(payload.as_bytes()).unwrap().unwrap();
 
         let tr = tracer();
         let tr = tr.inner.lock().unwrap();
-        tr.0.span(format!("{} {}", req.method.unwrap(), req.path.unwrap()))
+        let span = tr.0.span(format!("{} {}", req.method.unwrap(), req.path.unwrap()))
             .tag(Tag::new("to", format!("{}", t.dst_addr)))
             .start_time(SystemTime::now())
             .start();
 
-        t.req = Some(payload);
+        t.req_body = Some(payload[body_start..(payload.len()-1)].to_string());
+        let headers = payload[0..body_start-2].to_string();
+
+        let _tid = span.context().unwrap().state().to_string();
+
+        t.req_headers = Some(format!("{}{}: {}\r\n\r\n", headers, "uber-trace-id", _tid.to_string()));
     }
 }
 
@@ -101,24 +109,41 @@ fn process_response(sockfd: c_int, payload: String) {
         let t = traces();
         let mut t = t.inner.lock().unwrap();
         if let Some(t) = t.get_mut(&sockfd) {
-            t.res = Some(payload);
-            if t.req.is_some() {
-                let req_str = t.req.as_ref().unwrap();
-                let res_str = t.res.as_ref().unwrap();
+            if t.req_headers.is_some() {
+                println!("PROCESS RES");
+                let mut res_headers = [httparse::EMPTY_HEADER; 16];
+                let mut res = httparse::Response::new(&mut res_headers);
+                res.parse(payload.as_bytes()).unwrap().unwrap();
+
+                let req_str = t.req_headers.as_ref().unwrap();
 
                 let mut req_headers = [httparse::EMPTY_HEADER; 16];
                 let mut req = httparse::Request::new(&mut req_headers);
                 req.parse(req_str.as_bytes()).unwrap();
 
-                let mut res_headers = [httparse::EMPTY_HEADER; 16];
-                let mut res = httparse::Response::new(&mut res_headers);
-                res.parse(res_str.as_bytes()).unwrap();
+                {
+                    let tr = tracer();
+                    let tr = tr.inner.lock().unwrap();
+                    let mut carrier = HashMap::new();
+                    let header = req.headers;
+                    for field in header {
+                        carrier.insert(field.name, field.value);
+                    }
+                    println!("{:?}", req_str);
+                    println!("{:?}", carrier);
+                    let ctx = SpanContext::extract_from_http_header(&carrier).unwrap().unwrap();
+                    tr.0.span(format!("{} {}", req.method.unwrap(), req.path.unwrap()))
+                        .tag(Tag::new("code", format!("{}", res.code.unwrap())))
+                        .start_time(SystemTime::now())
+                        .follows_from(&ctx)
+                        .start();
+                }
 
                 let tr = tracer();
-                let span = tr.inner.lock().unwrap().1.recv_timeout(Duration::from_secs(1)).unwrap();
+                let span = &tr.inner.lock().unwrap().1;
 
                 let reporter = JaegerCompactReporter::new("sample_service").unwrap();
-                reporter.report(&[span]).unwrap();
+                reporter.report(&span.try_iter().collect::<Vec<_>>()).unwrap();
             }
         }
     }
@@ -129,10 +154,11 @@ fn add_trace(sockfd: c_int, addr_in: Option<SockAddr>) {
     if let Some(addr_in) = addr_in {
         let trace = Trace {
             dst_addr: Box::new(addr_in.to_str()),
-            req: None,
-            res: None,
+            req_headers: None,
+            req_body: None,
         };
         if !traces().inner.lock().unwrap().contains_key(&sockfd) {
+            println!("ADDTRACE");
             traces().inner.lock().unwrap().insert(sockfd, trace);
         }
     }
@@ -140,6 +166,7 @@ fn add_trace(sockfd: c_int, addr_in: Option<SockAddr>) {
 
 hook! {
     unsafe fn connect(sockfd: c_int, sockaddr_ptr: *mut sockaddr, len: socklen_t) -> isize => my_connect {
+        println!("CONNECT");
         let retval = real!(connect)(sockfd, sockaddr_ptr, len);
         let addr_in = from_libc_sockaddr(sockaddr_ptr);
         add_trace(sockfd, addr_in);
@@ -149,6 +176,7 @@ hook! {
 
 hook! {
     unsafe fn recv(sockfd: c_int, _ptr: *mut c_char, len: size_t, flags: c_int) -> ssize_t => my_recv {
+        println!("RECV");
         let retval = real!(recv)(sockfd, _ptr, len, flags);
         let mut vec: Vec<i8> = vec![0; 8192];
         ptr::copy_nonoverlapping(_ptr as *mut i8, vec.as_mut_ptr(), vec.len());
@@ -161,6 +189,7 @@ hook! {
 
 hook! {
     unsafe fn send(sockfd: c_int, _ptr: *mut c_char, len: size_t, flags: c_int) -> ssize_t => my_send {
+        println!("SEND");
         let retval = real!(send)(sockfd, _ptr, len, flags);
         let mut vec: Vec<i8> = vec![0; 8192];
         ptr::copy_nonoverlapping(_ptr as *mut i8, vec.as_mut_ptr(), vec.len());

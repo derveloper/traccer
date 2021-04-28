@@ -9,13 +9,11 @@ edition = "2018"
 [dependencies]
 redhook = "2.0"
 libc = "0.2.93"
-rayon = "1.5"
 nix = "0.20.0"
 httparse = "1.4.0"
 rustracing_jaeger = "0.6.1"
 rustracing = "0.5.0"
-crossbeam-channel = "0.5"
 
 [lib]
-name = "mylib"
+name = "traccer"
 crate_type = ["dylib"]

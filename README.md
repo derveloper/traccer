@@ -11,5 +11,5 @@ This library is for educational purposes, it doesn't do what it pretend to, it e
 you can use traccer via `LD_PRELOAD`:
 
 ```shell
-cargo build && LD_PRELOAD=target/debug/libtraccer.so curl google.de
+cargo build && LD_PRELOAD=target/debug/libtraccer.so perl -MLWP::UserAgent -le 'print LWP::UserAgent->new(requests_redirectable => [])->get(shift)->decoded_content()' "http://httpbin.org/delay/2"
 ```

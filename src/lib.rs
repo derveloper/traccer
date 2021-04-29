@@ -29,6 +29,16 @@ struct Trace {
 
 static TRACE_RUNNING: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "debug")]
+macro_rules! debug_print {
+    ($( $args:expr ),*) => { dbg!( $( $args ),* ); }
+}
+
+// Non-debug version
+#[cfg(not(feature = "debug"))]
+macro_rules! debug_print {
+    ($( $args:expr ),*) => {}
+}
 
 fn vec_i8_into_u8(v: Vec<i8>) -> Vec<u8> {
     let mut v = std::mem::ManuallyDrop::new(v);
@@ -42,7 +52,7 @@ fn vec_i8_into_u8(v: Vec<i8>) -> Vec<u8> {
 
 fn start_trace(sockfd: c_int, payload: String, t: &mut MutexGuard<HashMap<i32, Trace>>) {
     if let Some(t) = t.get_mut(&sockfd) {
-        //println!("PROCESS REQ");
+        debug_print!("PROCESS REQ");
         let mut req_headers = [httparse::EMPTY_HEADER; 16];
         let mut req = httparse::Request::new(&mut req_headers);
         let body_start = req.parse(payload.as_bytes()).unwrap().unwrap();
@@ -66,7 +76,7 @@ fn start_trace(sockfd: c_int, payload: String, t: &mut MutexGuard<HashMap<i32, T
 fn end_trace(sockfd: c_int, payload: String, t: &mut MutexGuard<HashMap<i32, Trace>>) {
     if let Some(t) = t.get_mut(&sockfd) {
         if t.req_headers.is_some() {
-            println!("PROCESS RES");
+            debug_print!("PROCESS RES");
             let mut res_headers = [httparse::EMPTY_HEADER; 16];
             let mut res = httparse::Response::new(&mut res_headers);
             res.parse(payload.as_bytes()).unwrap().unwrap();
@@ -95,7 +105,7 @@ fn report_trace() {
     reporter.report(&span.try_iter().collect::<Vec<_>>()).unwrap();
 }
 
-fn add_span(res: Response, req_str: &String, req: Request) {
+fn add_span(res: Response, _req_str: &String, req: Request) {
     let tr = tracer();
     let tr = tr.inner.lock().unwrap();
     let mut carrier = HashMap::new();
@@ -103,14 +113,16 @@ fn add_span(res: Response, req_str: &String, req: Request) {
     for field in header {
         carrier.insert(field.name, field.value);
     }
-    println!("{:?}", req_str);
-    println!("{:?}", carrier);
+
     let ctx = SpanContext::extract_from_http_header(&carrier).unwrap().unwrap();
     tr.0.span(format!("{} {}", req.method.unwrap(), req.path.unwrap()))
         .tag(Tag::new("code", format!("{}", res.code.unwrap())))
         .start_time(SystemTime::now())
         .follows_from(&ctx)
         .start();
+
+    debug_print!(_req_str);
+    debug_print!(carrier);
 }
 
 fn create_trace(sockfd: i32, t: &mut MutexGuard<HashMap<i32, Trace>>, addr_in: Option<String>) {
@@ -124,13 +136,13 @@ fn create_trace(sockfd: i32, t: &mut MutexGuard<HashMap<i32, Trace>>, addr_in: O
 
 fn add_trace(sockfd: c_int, addr_in: Option<SockAddr>, t: &mut MutexGuard<HashMap<i32, Trace>>) {
     if !t.contains_key(&sockfd) && addr_in.is_none() {
-        println!("ADDTRACE w/o addr");
+        debug_print!("ADDTRACE w/o addr");
         create_trace(sockfd, t, None);
     }
 
     if let Some(addr_in) = addr_in {
         if t.contains_key(&sockfd) {
-            println!("ADDTRACE w/ addr");
+            debug_print!("ADDTRACE w/ addr");
             create_trace(sockfd, t, Some(addr_in.to_str()));
         }
     }
@@ -139,7 +151,7 @@ fn add_trace(sockfd: c_int, addr_in: Option<SockAddr>, t: &mut MutexGuard<HashMa
 hook! {
     unsafe fn socket(domain: c_int, socktype: c_int, protocol: c_int) -> c_int => my_socket {
         let sockfd = real!(socket)(domain, socktype, protocol);
-        println!("SOCKET {} {} {} {}", sockfd, domain, socktype, protocol);
+        debug_print!("SOCKET", sockfd, domain, socktype, protocol);
         if domain == 2 {
             let running = TRACE_RUNNING.swap(true, Ordering::Relaxed);
             if !running {
@@ -156,8 +168,8 @@ hook! {
     unsafe fn connect(sockfd: c_int, sockaddr_ptr: *mut sockaddr, len: socklen_t) -> isize => my_connect {
         let retval = real!(connect)(sockfd, sockaddr_ptr, len);
         let addr_in = from_libc_sockaddr(sockaddr_ptr);
-        if let Some(a) = addr_in {
-            println!("CONNECT {} {}", sockfd, a.to_str());
+        if let Some(_a) = addr_in {
+            debug_print!("CONNECT", sockfd, _a.to_str());
             let t = traces();
             let mut t = t.inner.try_lock().unwrap();
             add_trace(sockfd, addr_in, &mut t);
@@ -168,7 +180,7 @@ hook! {
 
 hook! {
     unsafe fn recv(sockfd: c_int, _ptr: *mut c_char, len: size_t, flags: c_int) -> ssize_t => my_recv {
-        println!("RECV");
+        debug_print!("RECV");
         let retval = real!(recv)(sockfd, _ptr, len, flags);
         let mut vec: Vec<i8> = vec![0; 8192];
         ptr::copy_nonoverlapping(_ptr as *mut i8, vec.as_mut_ptr(), vec.len());
@@ -183,7 +195,7 @@ hook! {
 
 hook! {
     unsafe fn send(sockfd: c_int, _ptr: *mut c_char, len: size_t, flags: c_int) -> ssize_t => my_send {
-        println!("SEND");
+        debug_print!("SEND");
         let retval = real!(send)(sockfd, _ptr, len, flags);
         let mut vec: Vec<i8> = vec![0; 8192];
         ptr::copy_nonoverlapping(_ptr as *mut i8, vec.as_mut_ptr(), vec.len());
@@ -203,7 +215,7 @@ hook! {
         let t = traces();
         let mut t = t.inner.try_lock().unwrap();
         if t.contains_key(&sockfd) {
-            println!("READ {} {}", sockfd, t.get(&sockfd).unwrap().dst_addr.as_ref().unwrap());
+            debug_print!("READ", sockfd, t.get(&sockfd).unwrap().dst_addr.as_ref().unwrap());
             let mut vec: Vec<i8> = vec![0; 8192];
             ptr::copy_nonoverlapping(_ptr as *mut i8, vec.as_mut_ptr(), vec.len());
             let vec2: Vec<u8> = vec_i8_into_u8(vec);
@@ -225,7 +237,7 @@ hook! {
             let t = traces();
             let mut t = t.inner.try_lock().unwrap();
             if t.contains_key(&sockfd) {
-                println!("WRITE");
+                debug_print!("WRITE");
                 start_trace(sockfd, payload, &mut t);
             }
         }

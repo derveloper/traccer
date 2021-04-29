@@ -15,6 +15,7 @@ use rustracing_jaeger::span::SpanContext;
 use std::collections::HashMap;
 use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicBool, Ordering};
+use httparse::{Response, Request};
 
 mod singleton;
 
@@ -83,9 +84,7 @@ fn vec_i8_into_u8(v: Vec<i8>) -> Vec<u8> {
     unsafe { Vec::from_raw_parts(p as *mut u8, len, cap) }
 }
 
-fn process_request(sockfd: c_int, payload: String, t: &mut MutexGuard<HashMap<i32, Trace>>) {
-    //let t = traces();
-    //let mut t = t.inner.try_lock().unwrap();
+fn start_trace(sockfd: c_int, payload: String, t: &mut MutexGuard<HashMap<i32, Trace>>) {
     if let Some(t) = t.get_mut(&sockfd) {
         //println!("PROCESS REQ");
         let mut req_headers = [httparse::EMPTY_HEADER; 16];
@@ -108,7 +107,7 @@ fn process_request(sockfd: c_int, payload: String, t: &mut MutexGuard<HashMap<i3
     }
 }
 
-fn process_response(sockfd: c_int, payload: String, t: &mut MutexGuard<HashMap<i32, Trace>>) {
+fn end_trace(sockfd: c_int, payload: String, t: &mut MutexGuard<HashMap<i32, Trace>>) {
     if let Some(t) = t.get_mut(&sockfd) {
         if t.req_headers.is_some() {
             println!("PROCESS RES");
@@ -117,34 +116,13 @@ fn process_response(sockfd: c_int, payload: String, t: &mut MutexGuard<HashMap<i
             res.parse(payload.as_bytes()).unwrap().unwrap();
 
             let req_str = t.req_headers.as_ref().unwrap();
-
             let mut req_headers = [httparse::EMPTY_HEADER; 16];
             let mut req = httparse::Request::new(&mut req_headers);
             req.parse(req_str.as_bytes()).unwrap();
 
-            {
-                let tr = tracer();
-                let tr = tr.inner.lock().unwrap();
-                let mut carrier = HashMap::new();
-                let header = req.headers;
-                for field in header {
-                    carrier.insert(field.name, field.value);
-                }
-                println!("{:?}", req_str);
-                println!("{:?}", carrier);
-                let ctx = SpanContext::extract_from_http_header(&carrier).unwrap().unwrap();
-                tr.0.span(format!("{} {}", req.method.unwrap(), req.path.unwrap()))
-                    .tag(Tag::new("code", format!("{}", res.code.unwrap())))
-                    .start_time(SystemTime::now())
-                    .follows_from(&ctx)
-                    .start();
-            }
+            add_span(res, req_str, req);
 
-            let tr = tracer();
-            let span = &tr.inner.lock().unwrap().1;
-
-            let reporter = JaegerCompactReporter::new("sample_service").unwrap();
-            reporter.report(&span.try_iter().collect::<Vec<_>>()).unwrap();
+            report_trace();
 
             TRACE_RUNNING.swap(false, Ordering::Relaxed);
         }
@@ -153,26 +131,51 @@ fn process_response(sockfd: c_int, payload: String, t: &mut MutexGuard<HashMap<i
     t.remove(&sockfd);
 }
 
+fn report_trace() {
+    let tr = tracer();
+    let span = &tr.inner.lock().unwrap().1;
+
+    let reporter = JaegerCompactReporter::new("sample_service").unwrap();
+    reporter.report(&span.try_iter().collect::<Vec<_>>()).unwrap();
+}
+
+fn add_span(res: Response, req_str: &String, req: Request) {
+    let tr = tracer();
+    let tr = tr.inner.lock().unwrap();
+    let mut carrier = HashMap::new();
+    let header = req.headers;
+    for field in header {
+        carrier.insert(field.name, field.value);
+    }
+    println!("{:?}", req_str);
+    println!("{:?}", carrier);
+    let ctx = SpanContext::extract_from_http_header(&carrier).unwrap().unwrap();
+    tr.0.span(format!("{} {}", req.method.unwrap(), req.path.unwrap()))
+        .tag(Tag::new("code", format!("{}", res.code.unwrap())))
+        .start_time(SystemTime::now())
+        .follows_from(&ctx)
+        .start();
+}
+
+fn create_trace(sockfd: i32, t: &mut MutexGuard<HashMap<i32, Trace>>, addr_in: Option<String>) {
+    let trace = Trace {
+        dst_addr: addr_in,
+        req_headers: None,
+        req_body: None,
+    };
+    t.insert(sockfd, trace);
+}
+
 fn add_trace(sockfd: c_int, addr_in: Option<SockAddr>, t: &mut MutexGuard<HashMap<i32, Trace>>) {
     if !t.contains_key(&sockfd) && addr_in.is_none() {
         println!("ADDTRACE w/o addr");
-        let trace = Trace {
-            dst_addr: None,
-            req_headers: None,
-            req_body: None,
-        };
-        t.insert(sockfd, trace);
+        create_trace(sockfd, t, None);
     }
 
     if let Some(addr_in) = addr_in {
         if t.contains_key(&sockfd) {
             println!("ADDTRACE w/ addr");
-            let trace = Trace {
-                dst_addr: Some(addr_in.to_str()),
-                req_headers: None,
-                req_body: None,
-            };
-            t.insert(sockfd, trace);
+            create_trace(sockfd, t, Some(addr_in.to_str()));
         }
     }
 }
@@ -217,7 +220,7 @@ hook! {
         let payload: String = String::from_utf8_lossy(&vec2).to_string();
         let t = traces();
         let mut t = t.inner.try_lock().unwrap();
-        process_request(sockfd, payload, &mut t);
+        end_trace(sockfd, payload, &mut t);
         retval
     }
 }
@@ -232,7 +235,7 @@ hook! {
         let payload: String = String::from_utf8_lossy(&vec2).to_string();
         let t = traces();
         let mut t = t.inner.try_lock().unwrap();
-        process_request(sockfd, payload, &mut t);
+        start_trace(sockfd, payload, &mut t);
         retval
 
     }
@@ -249,7 +252,7 @@ hook! {
             ptr::copy_nonoverlapping(_ptr as *mut i8, vec.as_mut_ptr(), vec.len());
             let vec2: Vec<u8> = vec_i8_into_u8(vec);
             let payload: String = String::from_utf8_lossy(&vec2).to_string();
-            process_response(sockfd, payload, &mut t);
+            end_trace(sockfd, payload, &mut t);
         }
         retval
     }
@@ -257,7 +260,6 @@ hook! {
 
 hook! {
     unsafe fn write(sockfd: c_int, _ptr: *mut libc::c_void, len: size_t) -> ssize_t => my_write {
-        //println!("WRITE");
         let mut vec: Vec<i8> = vec![0; 8192];
         ptr::copy_nonoverlapping(_ptr as *mut i8, vec.as_mut_ptr(), vec.len());
         let vec2: Vec<u8> = vec_i8_into_u8(vec);
@@ -267,11 +269,10 @@ hook! {
             let t = traces();
             let mut t = t.inner.try_lock().unwrap();
             if t.contains_key(&sockfd) {
-                //println!("WRITE");
-                process_request(sockfd, payload, &mut t);
+                println!("WRITE");
+                start_trace(sockfd, payload, &mut t);
             }
         }
         retval
     }
 }
-

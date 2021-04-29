@@ -14,6 +14,7 @@ use crate::singleton::{tracer, traces};
 use rustracing_jaeger::span::SpanContext;
 use std::collections::HashMap;
 use std::sync::MutexGuard;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod singleton;
 
@@ -22,6 +23,8 @@ struct Trace {
     req_headers: Option<String>,
     req_body: Option<String>,
 }
+
+static TRACE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 // this is taken from nix rust bindings: https://github.com/nix-rust/nix
 // all credits goes to them. license: MIT
@@ -142,6 +145,8 @@ fn process_response(sockfd: c_int, payload: String, t: &mut MutexGuard<HashMap<i
 
             let reporter = JaegerCompactReporter::new("sample_service").unwrap();
             reporter.report(&span.try_iter().collect::<Vec<_>>()).unwrap();
+
+            TRACE_RUNNING.swap(false, Ordering::Relaxed);
         }
     }
 
@@ -177,9 +182,12 @@ hook! {
         let sockfd = real!(socket)(domain, socktype, protocol);
         println!("SOCKET {} {} {} {}", sockfd, domain, socktype, protocol);
         if domain == 2 {
-            let t = traces();
-            let mut t = t.inner.try_lock().unwrap();
-            add_trace(sockfd, None, &mut t);
+            let running = TRACE_RUNNING.swap(true, Ordering::Relaxed);
+            if !running {
+                let t = traces();
+                let mut t = t.inner.try_lock().unwrap();
+                add_trace(sockfd, None, &mut t);
+            }
         }
         sockfd
     }
